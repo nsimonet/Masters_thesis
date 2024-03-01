@@ -1,0 +1,266 @@
+---
+title: "IF_analysis"
+author: "Nahuel_Simonet"
+date: '2023-12-07'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Load the required library
+library(ggplot2)
+library(ggforce)
+library(scales)
+library(tidyr)
+library(dplyr)
+library(ggpubr)
+library(broom)
+library(wesanderson)
+
+# Read the CSV file into a data frame (replace 'your_file.csv' with your actual file path)
+result_df <- read.csv("/Users/nahuelsimonet/Documents/UZH/00_Master_Thesis/5.3_IF/result.csv")
+
+result_df <- na.omit(result_df)
+# Function to detect outliers based on IQR and replace them with NA
+remove_outliers <- function(x) {
+  q1 <- quantile(x, 0.25)
+  q3 <- quantile(x, 0.75)
+  iqr <- q3 - q1
+  x[(x < (q1 - 1.5 * iqr)) | (x > (q3 + 1.5 * iqr))] <- NA
+  return(x)
+}
+
+# Remove outliers from 'int_CN_ratio' column
+result_df$int_CN_ratio <- remove_outliers(result_df$int_CN_ratio)
+result_df <- na.omit(result_df)
+
+result_df$type <- factor(result_df$type, levels = c("WT", "HL", "HY", "RL", "RW", "PF"),
+                         labels = c("wild-type", "H304L", "H304Y", "R325L", "R325W", "P208F"))
+# List of names to remove from the 'name' column
+names_to_remove <- c("HL_0001","HL_0003", "HL_0006", "HL_0008", "HL_0013", "HL_0015", "HL_0019", "HL_0022", "HY_0005", "HY_0007","HY_0017","HY_0019","HY_0021","HY_0025","PF_0004","PF_0007","PF_0013","PF_0020","PF_0024","RL_0001","RL_0003","RL_0006","RL_0007","RL_0010","RL_0020","RL_0022","RL_0024","RL_0027","RL_0029","RW_0003","RW_0006","RW_0014","RW_0020","RW_0021","RW_0025","RW_0026","RW_0030","RW_0032","WT_0001","WT_0004","WT_0016","WT_0017","WT_0020","WT_0021","WT_0023","WT_0025","WT_0030")
+
+# Filter out rows containing specific names from the 'result_df' dataset
+result_df <- result_df %>%
+  filter(!(name %in% names_to_remove))
+
+# Create a prettier boxplot
+p <- ggplot(result_df, aes(x = type, y = int_CN_ratio, fill = type)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(position = position_jitter(width = 0.3), alpha = 0.5) +
+  scale_fill_manual(values = wes_palette(n = 6, name = "AsteroidCity2")) +  # Change the palette here
+  labs(title = "",
+       x = "Mutations in RCC1",
+       y = "Integrated Intensity RAN:\nCytoplasm/Nucleus") +
+theme_classic()+
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    text = element_text(family = "Times New Roman", size = 16)  # Adjust the size as needed
+  ) +
+  guides(fill = FALSE) +
+  scale_y_continuous(labels = scales::comma)  # Formatting y-axis labels if needed
+
+
+# Create a violin plot
+v <- ggplot(result_df, aes(x = type, y = int_CN_ratio, fill = type)) +
+  geom_violin(alpha = 0.7) +
+  geom_jitter(position = position_jitter(width = 0.3), alpha = 0.5) +
+  scale_fill_manual(values = wes_palette(n = 6, name = "AsteroidCity2")) +  # Change the palette here
+  labs(title = "",
+       x = "Mutations in RCC1",
+       y = "Integrated Intensity RAN:\nCytoplasm/Nucleus") +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    text = element_text(family = "Times New Roman", size = 16)  # Adjust the size as needed
+  ) +
+  guides(fill = FALSE) +
+  scale_y_continuous(labels = scales::comma)  # Formatting y-axis labels if needed
+
+
+# Create a sinaplot
+s <- ggplot(result_df, aes(x = type, y = int_CN_ratio, fill = type)) +
+  geom_violin(alpha = 0.7) +
+  geom_sina(alpha = 0.7, position = position_nudge(x = 0)) +  # Adjust position as needed
+  scale_fill_manual(values = wes_palette(n = 6, name = "AsteroidCity2")) +  # Change the palette here
+  labs(title = "",
+       x = "Mutations in RCC1",
+       y = "Integrated Intensity RAN:\nCytoplasm/Nucleus") +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    text = element_text(family = "Times New Roman", size = 16)  # Adjust the size as needed
+  ) +
+  guides(fill = FALSE) +
+  scale_y_continuous(labels = scales::comma)
+
+# Print the sinaplot
+print(s)
+```
+
+
+add statistics: t.test wild-type to mutant
+```{r setup, include=FALSE}
+
+# Get unique types in the 'type' column of result_df
+unique_types <- unique(result_df$type)
+
+# Perform t-tests for 'int_CN_ratio' comparing 'wild-type' vs. rest of types
+ttest_results <- lapply(unique_types, function(current_type) {
+  if (current_type != "wild-type") {
+    wt_data <- subset(result_df, type == "wild-type")$int_CN_ratio
+    current_type_data <- subset(result_df, type == current_type)$int_CN_ratio
+    
+    ttest_result <- t.test(wt_data, current_type_data)
+    
+    return(list(Type = current_type, T_Test_Result = ttest_result))
+  }
+})
+
+# Access the t-test results for 'wild-type' vs. rest of types
+for (result in ttest_results) {
+  cat("Comparison with wild-type for Type:", result$Type, "\n")
+  print(result$T_Test_Result)
+  cat("\n")
+}
+
+# Assuming 'result_df' is your dataset and 'type' contains different types
+
+# Filter 'wild-type' data for comparison
+wt_data <- subset(result_df, type == "wild-type")$int_CN_ratio
+
+# Perform pairwise t-test against 'wild-type'
+pairwise_comparison <- result_df %>%
+  filter(type != "wild-type") %>%
+  group_by(type) %>%
+  summarise(p_value = t.test(int_CN_ratio, wt_data)$p.value)
+
+# Display the pairwise comparison results
+print(pairwise_comparison)  
+
+# Visualize the comparison--> change font with paint
+p +
+  stat_compare_means(method = "anova", label.y = max(result_df$int_CN_ratio) + 0.5) +
+  stat_compare_means(label = "p.signif", method = "t.test", ref.group = "wild-type", label.y = max(result_df$int_CN_ratio)+0.1)
+
+v +
+  stat_compare_means(method = "anova", label.y = max(result_df$int_CN_ratio) + 0.5) +
+  stat_compare_means(label = "p.signif", method = "t.test", ref.group = "wild-type", label.y = max(result_df$int_CN_ratio)+0.1)
+
+s +
+  stat_compare_means(method = "anova", label.y = max(result_df$int_CN_ratio) + 0.5) +
+  stat_compare_means(label = "p.signif", method = "t.test", ref.group = "wild-type", label.y = max(result_df$int_CN_ratio)+0.1)
+
+```
+
+
+
+analysis by mean of intensity
+```{r setup, include=FALSE}
+# Calculate the ratio and add it as a new column 'intensity_ratio' in result_df
+result_df$intensity_ratio <- result_df$cyto_intensity_mean/result_df$nuc_intensity_mean
+result_df$intensity_ratio <- remove_outliers(result_df$intensity_ratio)
+result_df <- na.omit(result_df)
+
+# Create a prettier boxplot
+p <- ggplot(result_df, aes(x = type, y =intensity_ratio , fill = type)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(position = position_jitter(width = 0.3), alpha = 0.5) +
+  scale_fill_manual(values = wes_palette(n = 6, name = "AsteroidCity2")) +  # Change the palette here
+ labs(title = "",
+       x = "Mutations in RCC1",
+       y = "Mean Intensity RAN:\nCytoplasm/Nucleus") +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    text = element_text(family = "Times New Roman", size = 16)  # Adjust the size as needed
+  ) +
+  guides(fill = FALSE) +
+  scale_y_continuous(labels = scales::comma)
+
+# Create a violin plot
+v <- ggplot(result_df, aes(x = type, y = intensity_ratio, fill = type)) +
+  geom_violin(alpha = 0.7) +
+  geom_jitter(position = position_jitter(width = 0.3), alpha = 0.5) +
+  scale_fill_manual(values = wes_palette(n = 6, name = "AsteroidCity2")) +  # Change the palette here
+  labs(title = "",
+       x = "Mutations in RCC1",
+       y = "Mean Intensity RAN:\nCytoplasm/Nucleus") +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    text = element_text(family = "Times New Roman", size = 16)  # Adjust the size as needed
+  ) +
+  guides(fill = FALSE) +
+  scale_y_continuous(labels = scales::comma)
+
+# Create a sinaplot
+s <- ggplot(result_df, aes(x = type, y = intensity_ratio, fill = type)) +
+  geom_violin(alpha = 0.7) +
+  geom_sina(alpha = 0.7, position = position_nudge(x = 0)) +  # Adjust position as needed
+  scale_fill_manual(values = wes_palette(n = 6, name = "AsteroidCity2")) +  # Change the palette here
+  labs(title = "",
+       x = "Mutations in RCC1",
+       y = "Mean Intensity RAN:\nCytoplasm/Nucleus") +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    text = element_text(family = "Times New Roman", size = 16)  # Adjust the size as needed
+  ) +
+  guides(fill = FALSE) +
+  scale_y_continuous(labels = scales::comma)
+
+```
+
+
+add statistics: t.test wild-type to mutant
+
+```{r setup, include=FALSE}
+# Get unique types in the 'type' column of result_df
+unique_types <- unique(result_df$type)
+
+# Perform t-tests for 'intensity_ratio' comparing 'wild-type' vs. rest of types
+ttest_results <- lapply(unique_types, function(current_type) {
+  if (current_type != "wild-type") {
+    wt_data <- subset(result_df, type == "wild-type")$intensity_ratio
+    current_type_data <- subset(result_df, type == current_type)$intensity_ratio
+    
+    ttest_result <- t.test(wt_data, current_type_data)
+    
+    return(list(Type = current_type, T_Test_Result = ttest_result))
+  }
+})
+
+# Access the t-test results for 'wild-type' vs. rest of types
+for (result in ttest_results) {
+  cat("Comparison with wild-type for Type:", result$Type, "\n")
+  print(result$T_Test_Result)
+  cat("\n")
+}
+
+# Assuming 'result_df' is your dataset and 'type' contains different types
+
+# Filter 'wild-type' data for comparison
+wt_data <- subset(result_df, type == "wild-type")$intensity_ratio
+
+# Perform pairwise t-test against 'wild-type'
+pairwise_comparison <- result_df %>%
+  filter(type != "wild-type") %>%
+  group_by(type) %>%
+  summarise(p_value = t.test(intensity_ratio, wt_data)$p.value)
+
+# Display the pairwise comparison results
+print(pairwise_comparison)  
+
+# Visualize the comparison
+p +
+  stat_compare_means(method = "anova", label.y = max(result_df$intensity_ratio) + 0.3) +
+  stat_compare_means(label = "p.signif", method = "t.test", ref.group = "wild-type", label.y = max(result_df$intensity_ratio)+0.1)
+
+v +
+  stat_compare_means(method = "anova", label.y = max(result_df$intensity_ratio) + 0.3) +
+  stat_compare_means(label = "p.signif", method = "t.test", ref.group = "wild-type", label.y = max(result_df$intensity_ratio)+0.1)
+
+s +
+  stat_compare_means(method = "anova", label.y = max(result_df$intensity_ratio) + 0.3) +
+  stat_compare_means(label = "p.signif", method = "t.test", ref.group = "wild-type", label.y = max(result_df$intensity_ratio)+0.1)
+
+```
