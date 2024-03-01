@@ -1,0 +1,816 @@
+---
+title: "Kinetics_Tina_Code"
+author: "Nahuel_Simonet"
+date: '2023-11-21'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+## this script fits the GEF-mediated nucleotide exchange FRET data from the HiTek Synergy H1 plate reader
+### it does either an exponential or a linear fit, using the provided starting parameters
+## it outputs the initial velocities and finally the Michaelis-Menten fits
+#### import libraries
+library(tidyverse)
+library(viridis)
+library(lubridate)
+library(minpack.lm)
+library(ggrepel)
+
+library(paletteer)
+library(readxl)
+library(wesanderson)
+col= wes_palette("Royal2")
+#install.packages("nnet")
+library(nnet)
+library(dplyr)
+#install.packages("ggrepel")
+#library(scales)
+library(writexl)
+
+## READ and FORMAT the raw ASCII data from Synergy H1
+####### a function to read in all the biotek files, gather the data and reformat the time columns
+
+readin_raw_data <- function(file){
+RCC1.data <- read_excel(file, sheet = 'Result sheet', range = anchored("A60", dim = c(NA, NA)))
+RCC1.data <- RCC1.data[, -ncol(RCC1.data)] #modified this
+complete_rows <- RCC1.data[complete.cases(RCC1.data), ]
+
+# convert all columns except the first one to numeric
+complete_rows <- complete_rows %>%
+  mutate_at(vars(-`Cycle Nr.`), as.numeric)
+
+#transpose data
+transposed_data <- t(complete_rows)
+
+# Set the first row as column names
+colnames(transposed_data) <- transposed_data[1, ]
+#rownames(transposed_data) <- transposed_data[,1]
+
+# Remove the first row and convert data to data.frame, transform data characters to numeric
+transposed_data <- transposed_data[-1,]
+transposed_data <- as.data.frame(transposed_data)
+transposed_data[] <- apply(transposed_data, 2, as.numeric)
+write.table(transposed_data, "GEF_assay_Trp_FRET_.txt", sep = "\t", row.names = FALSE)
+return(transposed_data)
+}
+read_and_gather <- function(file) {
+  #print(files[1])
+  #file <-files[1]
+  print(file)
+  setwd("/Users/nahuelsimonet/Documents/UZH/00_Master_Thesis/Kinetics/Kinetics_assay_RCC1_WT")
+  #index <- read_tsv("data_index.txt")
+  data_in<- readin_raw_data(file)
+  names(data_in)[names(data_in) == "Time [s]"] <- "Time"
+  data_gathered <- data_in %>% 
+    select(., -2) %>% 
+    gather(., key = well, value = fluorescence, -Time)
+  dataset <- index %>% 
+    filter(., data_file == file) %>% 
+    inner_join(., data_gathered, by = "well", multiple = "all") %>% 
+    mutate("condition" = str_c(date, sample, well, GEF_conc_nM, sep = "-"),
+           "row" = str_sub(well, 1, 1), "column" = str_sub(well, 2)) %>% 
+    mutate("cutoff_time" = ifelse(is.na(cutoff_time), max(Time, na.rm = T), cutoff_time)) %>% 
+    filter(Time < cutoff_time)
+  return(dataset)
+}
+# combine all the files into one tibble
+(files <- dir("/Users/nahuelsimonet/Documents/UZH/00_Master_Thesis/Kinetics/Kinetics_assay_RCC1_WT", pattern = "TP_GEF_assay", full.names = T))
+outfile <- "/Users/nahuelsimonet/Documents/UZH/00_Master_Thesis/Kinetics/Kinetics_assay_RCC1_WT/data_parsed_new.txt"
+### load the index file (has conditions per well)
+(index <- read_tsv("/Users/nahuelsimonet/Documents/UZH/00_Master_Thesis/Kinetics/Kinetics_assay_RCC1_WT/data_index.txt", col_names = T))
+files <- index %>% 
+  pull(data_file) %>% unique()
+
+### read in the data files, join them with the info from the index file and make them tidy
+#data_points_to_discard <- read_tsv("GEF_assay/2018_data/data_to_discard.txt")
+( dataset <- do.call("bind_rows", lapply(files, FUN = read_and_gather)) )
+# Convert GEF_conc_uM from nM to μM
+dataset$GEF_conc_uM <- dataset$GEF_conc_nM / 1000
+write_tsv(dataset, path = outfile)
+
+run_nls <- function(data, debug = FALSE) {
+
+  #c0 <- data$conc[1]
+  c0 <- data$conc_uM[1]
+  #GEF_conc <- data$GEF_conc[1]
+  GEF_conc <- data$GEF_conc_uM[1]
+  k_est <- data$k_est[1]
+  span1_est <- data$span1[1]
+  span2_est <- data$span2[1]
+  deadtime <- data$deadtime[1]
+  f_plateau_est <- data$f_plateau[1]
+  back_signal <- data$back_signal[1]
+  if (back_signal == "exp") {
+    min_k_back <- 1e-5
+    #min_k_back <- 5e-5
+  } else {
+    min_k_back <- 0
+  }
+  #took out this dont know what it is for
+  #if (deadtime > 0) {
+  #  data <- data %>% 
+   #   mutate("Time" = Time + deadtime)
+  #}
+  #### debug mode: if debug is TRUE, print out condition being fit 
+  if (debug) { print(unique(data$condition)) }
+  start <- list(
+                f_plateau = f_plateau_est,
+                span1 = span1_est,
+                span2 = span2_est,
+                k = k_est,
+                k_background = 1e-4)
+  #lower <- c(
+   #             f_plateau_est - 0.2 * f_plateau_est,
+    #            span1_est - 0.05*span1_est,
+     #          0,
+      #        5e-4,
+       #       min_k_back)
+  #upper <- c(
+   #           f_plateau_est + 0.2 * f_plateau_est,
+    #         span1_est + 0.05*span1_est,
+     #       # max(data$observed, na.rm = T),
+      #       max(data$fluorescence, na.rm = T),
+       #       0.1,
+        #      3e-4)
+  
+  lower <- c(
+                f_plateau_est - 0.2 * f_plateau_est,
+                span1_est - 0.05*span1_est,
+               0,
+              5e-4,
+              min_k_back)
+  upper <- c(
+              f_plateau_est + 0.2 * f_plateau_est,
+             span1_est + 0.05*span1_est,
+            # max(data$observed, na.rm = T),
+             max(data$fluorescence, na.rm = T),
+              0.1,
+              3e-4)
+
+  #out <- nlsLM(observed ~ span1 * exp(-k * Time) + span2 * (exp(-k_background * Time)) + f_plateau,
+  out <- nlsLM(fluorescence ~ span1 * exp(-k * Time) + span2 * (exp(-k_background * Time)) + f_plateau,
+               data = data,
+               start = start,
+               lower = lower,
+               upper = upper,
+               control = nls.lm.control(maxiter = 500))
+  
+  #### save optimal parameters
+  f_plateau <- coef(out)[1]
+  span1 <- coef(out)[2]
+  span2 <- coef(out)[3]
+  k <- coef(out)[4]
+  print(str_c(data$condition[1], " ", k, " ", f_plateau, " ", span1))
+  k_background <- coef(out)[5]
+
+  data$predicted <- span1 * exp(-k * data$Time) + span2 * (exp(-k_background * data$Time)) + f_plateau
+  
+  data$exchange <- span1 * exp(-k * data$Time)  + f_plateau + span2
+  data$background <-  span2 * (exp(-k_background * data$Time)) + f_plateau #+ span1
+
+  #### save optimal parameters in the data table
+  #data$max_flo <- max(data$observed, na.rm = T)
+  data$max_flo <- max(data$fluorescence, na.rm = T)
+  data$k <- k
+  data$f_plateau <- f_plateau
+  data$k_background <- k_background
+  data$span1 <- span1
+  data$span2 <- span2
+  f0 <- span1 + span2 + f_plateau
+  data$f_mid <- f0 - span1
+  data$f0 <- f0
+  
+  ## get the fit statistics
+  # Chi Square in kaleidagraph is the total sum of the squared errors (sum((y-f(x))/sigma)^2)
+  # R in kaleidagraph is the Pearson's R (root 1- chi^2/sum(sig*(y-mean(y))^2)
+  sigma <- summary(out)$sigma
+  resid <- summary(out)$residuals
+  chisq <- out$m$deviance()
+  data$chisq <- chisq
+  data$pearsonr <- sqrt(1-chisq/sum(sigma*resid^2))
+  data$span1_pval <- log10(summary(out)$coefficients[,4][2])
+  data$k_pval <- log10(summary(out)$coefficients[,4][4])
+    ### calculate the initial rate
+  data$vf0 <- (span1 * k * exp(k * 0))
+  
+  sd_plot<- data %>%
+    ggplot(aes(x = Time, y = fluorescence)) +
+    geom_point(size = 2, color = wes_palette("Royal2")[5]) +
+    geom_line(data = data, aes(x = Time, y = predicted),
+    color = wes_palette('Royal2')[3], lwd = 2) +
+    xlab('time [s]') +
+    ylab('fluorescence') +
+    ggtitle(paste("Exp#", unique(data$experiment),unique(data$condition) ))+
+    theme_bw()
+  print(sd_plot)
+  #changed because keep Ran constant
+  #data$vf0 <- (span1 * k * exp(k * 0)) / (GEF_conc*0.001)   ### initial rate in fluorescence units
+  return(data)
+}
+
+run_linear <- function(data) {
+  
+  #max_fluo <- max(data$observed, na.rm = T)
+  max_fluo <- max(data$fluorescence, na.rm = T)
+  est_span <- 0.6 * max_fluo
+  initial_fraction <- data$linear_fit_fraction[1]
+  cutoff_fluo <- max_fluo - (initial_fraction * est_span)
+  #initial_change <- initial_fraction * (max_fluo - min(data$observed, na.rm = T))
+  #cutoff_fluo <- max_fluo - initial_change 
+  #initial_data <- data %>% filter(observed > cutoff_fluo)
+  initial_data <- data %>% filter(fluorescence > cutoff_fluo)
+ # fit <- lm(observed ~ Time, data = initial_data)
+  fit <- lm(fluorescence ~ Time, data = initial_data)
+  #data %>% ggplot(aes(x = Time, y = observed)) + geom_point() + 
+  # geom_abline(slope = fit$coefficients[2], intercept = fit$coefficients[1])
+  data %>% ggplot(aes(x = Time, y = fluorescence)) + geom_point() + 
+   geom_abline(slope = fit$coefficients[2], intercept = fit$coefficients[1])
+  slope <- fit$coefficients[2]
+  data$slope <- slope
+  data$intercept <- fit$coefficients[1]
+  #data$vf0 <- - slope / (data$GEF_conc[1] * 0.001)
+  data$vf0 <- - slope
+  data$f0 <- max_fluo
+  data <- data %>% 
+    #mutate("initial_linear" = ifelse(observed > cutoff_fluo, "initial_linear", "all"))
+    mutate("initial_linear" = ifelse(fluorescence > cutoff_fluo, "initial_linear", "all"))
+linear_plot <- data %>% ggplot(aes(x = Time, y = fluorescence)) + geom_point() + 
+    geom_abline(slope = fit$coefficients[2], intercept = fit$coefficients[1])+
+    xlab('time [s]') +
+    ylab('fluorescence') +
+    ggtitle(paste("Exp#", unique(data$experiment),unique(data$condition) ))+
+    theme_classic()
+  
+  print(linear_plot)
+  return(data)
+}
+fit_conversion_factor <- function(data) {
+  sample <- data$sample[1]
+  date <- data$date[1]
+  c_plateau_values <- list()
+  f_plateau_values <- list()
+  conditions <- data %>% 
+    #filter(fit == "exp") %>% 
+    pull(condition) %>% unique()
+  for (i in seq_along(conditions)) {
+    data_temp <- data %>% filter(condition == conditions[i])
+    c_plateau_values[[i]] = 0.995*data_temp$GEF_conc_uM[1]  # account 1/200 molecules being GDP instead of mGTP at steady-state
+    f_plateau_values[[i]] = data_temp$f0[1]
+  }
+  c_plateau_values <- unlist(c_plateau_values)
+  f_plateau_values <- unlist(f_plateau_values)
+  tib <- tibble("conc" = c_plateau_values, "fluor" = f_plateau_values)
+  out <- lm(c_plateau_values ~ f_plateau_values)
+  tib %>% ggplot(aes(fluor, conc)) + geom_point() + 
+    geom_abline(slope = out$coeff[2], intercept = out$coeff[1]) +
+    ggtitle(str_c(sample, " ", date))
+  #data$conversion_ratio = out$coef[2] # need to divide by the factor that accounts for trp signal decrease for mant bound
+  data$conversion_ratio = abs(out$coef[2])
+  data$v0 = data$vf0 * data$conversion_ratio*1000 #to have it in uM/s
+  return(data)
+}
+plot_raw_data <- function(data, by_sample = FALSE, output = getwd()) {
+  
+  today = gsub('-', '', today(tzone="US/Pacific")) # set date, for filenaming purposes
+  
+  if (by_sample) {
+    samples = unique(data$sample)
+    for (j in seq_along(samples)) {
+        data_mutant <- data %>% filter(sample == samples[j])
+        plots <- list()
+        conditions = unique(data_mutant$condition)
+        for (i in seq_along(conditions)) {
+          data_to_plot <- data_mutant %>% arrange(GEF_conc_uM) %>% filter(condition == conditions[i]) 
+          plots[[i]] <- ggplot(data_to_plot, mapping = aes(x = Time, y = fluorescence)) +
+            geom_point(color = "black") +
+            ggtitle(conditions[i])
+        }
+        pdf(paste0(output, paste(samples[j], 'raw_data.pdf', sep = '_')))
+        print(plots)
+        dev.off()
+    }
+  if (!by_sample) {
+    plots <- list()
+    conditions = unique(data$condition)
+    for (i in seq_along(conditions)) {
+      data_to_plot <- data %>% filter(condition == conditions[i]) 
+      plots[[i]] <- ggplot(data_to_plot, mapping = aes(x = Time, y = fluorescence)) +
+        geom_point(color = "black") +
+        ggtitle(conditions[i])
+    }
+    pdf(paste0(output, 'raw_data.pdf'))
+    print(plots)
+    dev.off()
+    }
+  }
+}
+
+plot_raw_data(dataset, by_sample = FALSE, output ="/Users/nahuelsimonet/Documents/UZH/00_Master_Thesis/Kinetics/Kinetics_assay_RCC1_WT")
+
+#### set output directory
+today <- gsub('-', '', today(tzone="US/Pacific")) # set date, for filenaming purposes
+output <- str_c('Data/RanGEF_assay/', today, '_GEF_output', '/')
+dir.create(output, showWarnings = FALSE)
+
+### first plot raw data for everything
+#plot_raw_data(dataset, by_sample = T, output = output)  ### do this only once
+
+#------------------------------------#------------------------------------#------------------------------------
+#for testing each experiment individually:
+
+(index <- read_tsv("/Users/nahuelsimonet/Documents/UZH/00_Master_Thesis/Kinetics/Kinetics_assay_RCC1_WT/data_index.txt", col_names = T))
+files <- index %>% 
+  pull(data_file) %>% unique()
+
+### read in the data files, join them with the info from the index file and make them tidy
+#data_points_to_discard <- read_tsv("GEF_assay/2018_data/data_to_discard.txt")
+( dataset <- do.call("bind_rows", lapply(files, FUN = read_and_gather)) )
+# Convert GEF_conc_nM from nM to μM
+dataset$GEF_conc_uM <- dataset$GEF_conc_nM / 1000
+
+subset_data <- dataset %>%
+ #filter(well== "G11" )%>%
+  #filter(!(well== "G9" ))%>%
+#filter(experiment == 14 )%>%
+#filter(experiment %in% c(13, 14, 15))%>%
+ filter(Time < 1500)
+
+#### Fit data assuming photobleaching decay is exponential, with observations in fluorescence units
+exp_fits <- subset_data %>% 
+  filter(fit == "exp") %>% pull(sample) %>% unique()
+if (length(exp_fits) > 0) {
+  processed.data_exp <- subset_data %>%
+    filter(fit == "exp") %>% 
+    mutate("observed" = fluorescence) %>%
+    group_by(sample, condition) %>%
+    do(run_nls(., debug = T)) %>%  # fit curve
+    ungroup()
+}
+
+lin_fits <- subset_data %>% 
+  filter(fit == "lin") %>% pull(sample) %>% unique()
+if (length(lin_fits) > 0) {
+processed.data_lin <- subset_data %>% 
+  filter(fit == "lin") %>% 
+  mutate("observed" = fluorescence) %>% 
+  group_by(sample, condition) %>%
+  do(run_linear(.)) %>%  # linear fit original run_linear_with_fixed_intercept(.)
+  ungroup() 
+}
+
+#------------------------------------#------------------------------------#------------------------------------
+
+#### Fit data assuming photobleaching decay is exponential, with observations in fluorescence units
+
+if (length(lin_fits) > 0 & length(exp_fits) > 0) {
+  processed.data <- full_join(processed.data_exp, processed.data_lin) 
+} else if (length(exp_fits) > 0) {
+  processed.data <- processed.data_exp
+} else if (length(lin_fits) > 0) {
+  processed.data <- processed.data_lin
+}
+
+processed.data <- processed.data %>% 
+  group_by(sample, date) %>%
+  do(fit_conversion_factor(.)) %>% 
+  mutate("v0" = vf0 * conversion_ratio*1000) %>% 
+  ungroup()
+
+# plot the fits - don't do this every time - too slow
+#plot_fits_show_bkgrnd(processed.data, output = output)
+
+if (length(exp_fits) > 0) {
+  fit.parameters <- processed.data %>% 
+    select(- data_file, -fluorescence, -observed, -predicted, -exchange) %>% 
+    unique() %>% 
+    arrange(sample, GEF_conc_uM) 
+} else {
+    fit.parameters <- processed.data %>% 
+      select(-observed, -data_file) %>% 
+      unique() %>% 
+      arrange(sample, GEF_conc_uM)
+}
+
+# fit.parameters %>%
+#    ggplot(., aes(x = conc, y = v0 , color = row, shape = as.character(date))) + 
+#    geom_point() + facet_grid(~ sample)
+
+initial_rates <- processed.data %>%
+  select(sample, v0, GEF_conc_uM, condition, date) %>% 
+  unique() 
+initial_rates %>% write_tsv('/Users/nahuelsimonet/Documents/UZH/00_Master_Thesis/Kinetics/Kinetics_assay_RCC1_WT/GEF_assay_initial_rate_data.txt')
+```
+
+calculating V0 vs GEF
+```{r setup9, include=FALSE}
+
+library(xtable)
+library(knitr)
+library(kableExtra)
+library(dplyr)
+library(ggpubr)
+library(extrafont)
+# Load Times New Roman font
+font_import(pattern = "Times New Roman")
+loadfonts()
+
+# Define the desired order of samples
+desired_order <- as.factor(c("RCC1_R325L_mt", "RCC1_WT", "RCC1_P208F_mt","RCC1_H304Y_mt", "RCC1_H304L_mt"))
+
+# Convert initial_rates$sample to a factor and reorder levels
+initial_rates <- initial_rates %>%
+  mutate(sample = factor(sample, levels = desired_order)) %>%
+  arrange(sample)
+
+# Now, initial_rates data frame is reordered based on the desired sample order
+
+# Get unique samples
+unique_samples <- as.factor(unique(initial_rates$sample))
+  
+
+# Create a list to store plots and fits
+plot_list <- list()
+fit_list <- list()
+linear_plot_list <- list()  # Store individual linear plots
+slope_table <- data.frame(
+  sample_name = character(),
+  "kcat/Km" = numeric(),
+  std_error = numeric(),
+  stringsAsFactors = FALSE
+)
+
+
+# Loop through each sample
+for (sample_name in unique_samples) {
+  # Subset data for the current sample
+  sample_data <- initial_rates %>%
+    filter(sample == sample_name) %>%
+    select(v0, GEF_conc_uM, sample) %>%
+    distinct()
+  
+  # Rename 'sample' column by removing '_' and 'mt'
+  sample_name <- gsub("_|mt", " ", sample_name)
+  
+  count_entries <- length(sample_data$v0)
+  
+  # Create ggplot for the current sample
+  plot_list[[sample_name]] <- ggplot(sample_data, aes(x = GEF_conc_uM, y = v0)) +
+    geom_point(aes(color = as.factor(sample)), shape = 16, size = 3) +
+    labs(x = "[GEF]", y = "V0", title = paste("V0 vs. GEF Concentration -", sample_name)) +
+    theme_classic()
+  #print(plot_list[[sample_name]])
+  # Fit linear model for the current sample
+  fit_list[[sample_name]] <- lm(v0 ~ GEF_conc_uM, data = sample_data)
+  print(summary(fit_list[[sample_name]]))
+  print("kcat/Km= ")
+  print(fit_list[[sample_name]]$coefficients[2])
+
+  coef_tab <- summary(fit_list[[sample_name]])$coefficients %>%
+as_tibble() %>%
+mutate('coefficient' = c('intercept', 'slope')) %>%
+mutate('upper_95' = Estimate + 2*`Std. Error`,
+'lower_95' = Estimate - 2*`Std. Error`)
+
+  # Create individual linear plots
+  linear_plot_list[[sample_name]] <- sample_data %>% ggplot(aes(x = GEF_conc_uM, y = v0)) +
+    geom_point(size = 2, color = wes_palette("Royal2")[5]) +
+    geom_text(x = Inf, y = -Inf, label = paste("N =", count_entries), hjust = 1.2, vjust = -1.5, size = 5, color = "grey50") +
+    geom_abline(
+      slope = fit_list[[sample_name]]$coefficients[2],
+      intercept = fit_list[[sample_name]]$coefficients[1],
+      color = wes_palette('Royal2')[3],
+      lwd = 2
+    ) +
+    geom_ribbon(
+    aes(
+      ymin = fit_list[[sample_name]]$coefficients[2] * GEF_conc_uM + coef_tab$lower_95[1],
+      ymax = fit_list[[sample_name]]$coefficients[2] * GEF_conc_uM + coef_tab$upper_95[1]
+    ),
+    alpha = 0.3
+  ) + # Add ribbon for std. error
+    labs(x = "[RCC1]", y = "V0", title = "V0 vs. GEF Concentration") +
+    ggtitle(paste(sample_name)) +
+    theme_classic()+
+   theme(
+    text = element_text(family = "Times New Roman", size = 16) ,  # for all text elements
+    plot.title = element_text(family = "Times New Roman", face = "bold"),  # for plot title
+    axis.title = element_text(family = "Times New Roman", face = "bold"),  # for axis titles
+    axis.text = element_text(family = "Times New Roman"),  # for axis text
+    legend.text = element_text(family = "Times New Roman"),  # for legend text
+    legend.title = element_text(family = "Times New Roman", face = "bold")  # for legend title
+    # Add other elements and their respective font families as needed
+  )
+  
+  rsquared <- summary(fit_list[[sample_name]])$r.squared
+  p_with_annotation <- linear_plot_list[[sample_name]] +
+  stat_regline_equation( aes(label = paste("R^2 = ", round(rsquared, 3))),
+    formula = y ~ x, 
+    size = 5,  # Adjust the font size here
+    vjust = 1,  # Vertical alignment adjustment
+    color = "grey50"  # Change font color to grey
+  ) 
+
+  print(p_with_annotation )
+  
+   # Get the summary of the linear model fit
+  fit_summary <- summary(fit_list[[sample_name]])
+
+  # Extract standard error for the slope (kcat/Km)
+  std_error <- fit_summary$coefficients["GEF_conc_uM", "Std. Error"]
+
+  # Check if the sample_name already exists in the slope_table
+  slope = fit_list[[sample_name]]$coefficients[2]
+  if (!(sample_name %in% slope_table$sample_name)) {
+    # Store sample name, slope (kcat/Km), and standard error in the table
+    slope_table[nrow(slope_table) + 1, ] <- list(sample_name, slope, std_error)
+  }
+  
+}
+print(slope_table)
+
+# Round numbers in the second column to one digit after the decimal point
+slope_table[,2] <- round(as.numeric(slope_table[,2]), 1)
+slope_table[,3] <- round(as.numeric(slope_table[,3]), 2)
+
+# Combine "kcat/Km" value and standard error into a single column
+slope_table[,2] <- paste0(slope_table[,2], " ± ", slope_table[,3])
+
+# Remove the last column from slope_table
+slope_table <- slope_table[, -3]
+
+# Rename columns
+names(slope_table)[1] <- "Sample name"
+names(slope_table)[2] <- "kcat/Km ± std error ($10^{-6} \\, \\text{M}^{-1} \\text{s}^{-1}$)"
+
+
+# Generate HTML table with updated slope_table
+html_table <- slope_table %>%
+  kable("html") %>%
+  kable_styling("striped", full_width = FALSE )
+
+# Print the HTML table
+print(html_table)
+```
+
+
+```{r setup9, include=FALSE}
+
+# Combine all sample_data into one dataframe
+combined_data <- do.call(rbind, lapply(unique_samples, function(sample_name) {
+  sample_data <- initial_rates %>%
+    filter(sample == sample_name) %>%
+    select(v0, GEF_conc_uM, sample) %>%
+    distinct()
+  return(sample_data)
+}))
+
+# Create a list to store fitted values
+fitted_values <- list()
+
+# Loop through each sample and calculate fitted values
+for (sample_name in unique_samples) {
+  sample_data <- combined_data %>%
+    filter(sample == sample_name)
+  print(sample_name)
+  
+  # Fit linear model for the current sample
+  fit <- lm(v0 ~ GEF_conc_uM, data = sample_data)
+  
+  # Predict fitted values for the current sample
+  predicted_values <- predict(fit)
+  
+  # Filter predicted values greater than 0
+  filtered_values <- data.frame(
+    GEF_conc_uM = sample_data$GEF_conc_uM[predicted_values >= -0.01],
+    fitted_v0 = predicted_values[predicted_values >= -0.01]
+  )
+  
+  fitted_values[[sample_name]] <- filtered_values
+ 
+}
+
+#fret plot combined + 95% confidence interval and points
+combined_plot_complete <- ggplot()+
+  lapply(seq_along(unique_samples), function(i) {
+    sample_name <- unique_samples[i]
+    # Loop through each sample
+  sample_data <- initial_rates %>%
+    filter(sample == sample_name) %>%
+    select(v0, GEF_conc_uM, sample) %>%
+    distinct()
+    geom_point(data = sample_data, aes(x = GEF_conc_uM, y = v0, color = sample_name), size = 2,
+    alpha = 0.5)
+  })
+
+combined_plot_complete <- combined_plot_complete +
+  lapply(seq_along(unique_samples), function(i) {
+    sample_name <- unique_samples[i]
+    # Loop through each sample
+  coef_tab <- summary(fit_list[[sample_name]])$coefficients %>%
+as_tibble() %>%
+mutate('coefficient' = c('intercept', 'slope')) %>%
+mutate('upper_95' = Estimate + 2*`Std. Error`,
+'lower_95' = Estimate - 2*`Std. Error`)
+     #print(coef_tab)
+  
+  geom_ribbon(data = sample_data,
+    aes(x = GEF_conc_uM, y = v0, 
+      ymin = fit_list[[sample_name]]$coefficients[2] * GEF_conc_uM + coef_tab$lower_95[1],
+      ymax = fit_list[[sample_name]]$coefficients[2] * GEF_conc_uM + coef_tab$upper_95[1]
+    ),
+    alpha = 0.2
+  ) # Add ribbon for std. error
+  })
+
+combined_plot_complete <- combined_plot_complete +
+  labs(x = "[GEF] in μM", y = "V0 in 1/s", title = "") +
+  theme_classic() +
+  scale_color_manual(
+    name = "Sample",
+    values = wes_palette("Royal2", length(unique_samples))
+  )+
+  theme(
+    text = element_text(family = "Times New Roman", size = 16) ,  # for all text elements
+    plot.title = element_text(family = "Times New Roman", face = "bold"),  # for plot title
+    axis.title = element_text(family = "Times New Roman", face = "bold"),  # for axis titles
+    axis.text = element_text(family = "Times New Roman"),  # for axis text
+    legend.text = element_text(family = "Times New Roman"),  # for legend text
+    legend.title = element_text(family = "Times New Roman", face = "bold")  # for legend title
+    # Add other elements and their respective font families as needed
+  )+
+  scale_x_continuous(limits = c(0.007, 0.031))
+
+combined_plot_complete <- combined_plot_complete+
+  lapply(seq_along(unique_samples), function(i) {
+    sample_name <- unique_samples[i]
+    geom_line(
+      data = fitted_values[[sample_name]],
+      aes(x = GEF_conc_uM, y = fitted_v0, color = sample_name),
+      linewidth = 1.2
+    )
+  })
+
+print(combined_plot_complete)
+
+
+
+#fret plot combined
+combined_plot <- ggplot()+
+  lapply(seq_along(unique_samples), function(i) {
+    sample_name <- unique_samples[i]
+    geom_line(
+      data = fitted_values[[sample_name]],
+      aes(x = GEF_conc_uM, y = fitted_v0, color = sample_name),
+      linewidth = 1.2
+    )
+  }) +
+  labs(x = "[GEF] in μM", y = "V0 in 1/s", title = "") +
+  theme_classic() +
+  scale_color_manual(
+    name = "Sample",
+    values = wes_palette("Royal2", length(unique_samples))
+  )+
+  theme(
+    text = element_text(family = "Times New Roman", size = 16) ,  # for all text elements
+    plot.title = element_text(family = "Times New Roman", face = "bold"),  # for plot title
+    axis.title = element_text(family = "Times New Roman", face = "bold"),  # for axis titles
+    axis.text = element_text(family = "Times New Roman"),  # for axis text
+    legend.text = element_text(family = "Times New Roman"),  # for legend text
+    legend.title = element_text(family = "Times New Roman", face = "bold")  # for legend title
+    # Add other elements and their respective font families as needed
+  )+
+  scale_x_continuous(limits = c(0.007, 0.031))
+
+
+
+print(combined_plot)
+
+```
+
+Correlation test between Kinetics assay result and van Leuweens data:Too few data!!!
+```{r setup9, include=FALSE}
+
+vL_data <- data.frame(
+  Mutation = c("RCC1 H304", "RCC1 R325", "RCC1 R325", "RCC1 P208"),
+  LFC_35C = c(-0.909155293, 0.535988607, 0.80762312, -0.946940985),
+  LFC_37C = c(-1.059013987, 0.330550099, 0.030450199, -0.454821926),
+  LFC_39C = c(-1.472739843, -2.782040166, -2.458972351, -0.73617129)
+)
+print(vL_data)
+
+slope_df <- data.frame(
+  Mutation = c("RCC1 H304", "RCC1 H304", "RCC1 R325", "RCC1 P208"),
+  `kcat/Km` = c(0.8, 3.2, 16.1, 5.5)
+)
+
+print(slope_df)
+
+# Merge the data frames on the "Mutation" column
+merged_data <- merge(vL_data, slope_df, by = "Mutation")
+
+# Calculate correlation between columns
+correlation_matrix <- cor(merged_data[, -1])  # Excluding the "Mutation" column
+
+# Assuming you've already merged the data frames and created 'merged_data'
+
+# Calculate correlation matrix
+correlation_matrix <- cor(merged_data[, -1])  # Excluding the "Mutation" column
+
+# Perform correlation test (p-values)
+cor_test <- cor.test(merged_data$LFC_35C, merged_data$kcat.Km, method = "pearson")  # Example for LFC_35C and LFC_37C
+
+# Print correlation matrix
+print(correlation_matrix)
+
+# Print correlation test results
+print(cor_test)
+
+# Visualization: Correlation matrix plot
+library(corrplot)
+corrplot(correlation_matrix, method = "color")
+
+# Visualization: Scatterplot for variables LFC_35C and LFC_37C
+plot(merged_data$LFC_35C, merged_data$kcat.Km, xlab = "LFC_35C", ylab = "kcat/Km", main = "Scatterplot")
+
+
+# Assuming you've merged the data frames into 'merged_data'
+
+# Group data by Mutation and calculate correlations within each group
+correlation_by_mutation <- merged_data %>%
+  group_by(Mutation) %>%
+  summarize(
+    cor_LFC_35C_LFC_37C = cor(LFC_35C, LFC_37C),
+    cor_LFC_35C_LFC_39C = cor(LFC_35C, LFC_39C),
+    cor_LFC_35C_kcat_Km = cor(LFC_35C, kcat.Km)
+    # Add more correlations as needed
+  )
+
+# Print correlations by Mutation
+print(correlation_by_mutation)
+
+
+```
+
+
+normalize and plot 15nM of all samples in one graph WTD7, HL A8, PFG8, HYE7, RL A7
+```{r setup9, include=FALSE}
+filtered_data <- dataset %>%
+  filter(Time <= 1500)
+
+# Assuming 'dataset' is your dataset
+# Normalize 'GEF_conc_nm' and 'fluorescence' columns between 0 and 1
+# Selecting RCC1_WT sample with well D7
+subdata_RCC1_WT <- filtered_data[filtered_data$sample == "RCC1_WT" & filtered_data$well == "D7", ]
+subdata_RCC1_WT$fluorescence <- rescale(subdata_RCC1_WT$fluorescence)
+
+# Selecting RCC1_H304L_mt sample with well A8
+subdata_RCC1_H304L_mt <- filtered_data[filtered_data$sample == "RCC1_H304L_mt" & filtered_data$well == "A8", ]
+subdata_RCC1_H304L_mt$fluorescence <- rescale(subdata_RCC1_H304L_mt$fluorescence)
+
+
+# Normalize 'fluorescence' columns between 0 and 1 for additional samples
+
+# Selecting RCC1_P208F_mt sample with well G8
+subdata_RCC1_P208F_mt <- filtered_data[filtered_data$sample == "RCC1_P208F_mt" & filtered_data$well == "G8", ]
+subdata_RCC1_P208F_mt$fluorescence <- rescale(subdata_RCC1_P208F_mt$fluorescence)
+
+# Selecting RCC1_H304Y_mt sample with well E7
+subdata_RCC1_H304Y_mt <- filtered_data[filtered_data$sample == "RCC1_H304Y_mt" & filtered_data$well == "E7" & filtered_data$GEF_conc_nM == 14.6, ]
+subdata_RCC1_H304Y_mt$fluorescence <- rescale(subdata_RCC1_H304Y_mt$fluorescence)
+
+# Selecting RCC1_R325L_mt sample with well A7
+subdata_RCC1_R325L_mt <- filtered_data[filtered_data$sample == "RCC1_R325L_mt" & filtered_data$well == "A7", ]
+subdata_RCC1_R325L_mt$fluorescence <- rescale(subdata_RCC1_R325L_mt$fluorescence)
+
+# Combine all subsets into one data frame
+combined_data <- rbind(subdata_RCC1_WT, subdata_RCC1_H304L_mt, subdata_RCC1_P208F_mt, subdata_RCC1_H304Y_mt, subdata_RCC1_R325L_mt)
+
+# Plot all subsets in one plot
+ggplot(combined_data, aes(x = Time, y = fluorescence, color = sample)) +
+  geom_point() +
+  labs(x = "GEF Concentration (nM)", y = "Fluorescence AUC", color = "Sample") +
+  ggtitle("Fluorescence measurement from TECAN at RCC1 concentration 15nM ") +
+   scale_color_manual(values = wes_palette("Royal2")) +  # Apply Royal2 colors
+theme_classic()+
+  theme(
+    text = element_text(family = "Times New Roman")  # Change font to Times New Roman
+    # Add other theme adjustments as necessary
+  )
+
+
+ 
+  # Assuming 'combined_data' contains the combined and normalized data
+
+ggplot(combined_data, aes(x = Time, y = fluorescence, color = sample, label = sample)) +
+  geom_point() +
+  labs(x = "Time [s]", y = "Trp fluorecence\n(Exc: 295nm; Emiss: 355nm)") +
+  #ggtitle("TECAN fluorescence measurement \n RCC1 concentration 15nM") +
+  scale_color_manual(values = wes_palette("Royal2")) +  # Apply Royal2 colors
+  theme_classic() +
+  theme(
+    text = element_text(family = "Times New Roman")  # Change font to Times New Roman
+    # Add other theme adjustments as necessary
+  ) +
+  guides(color = FALSE)  # Remove the legend
+
+```
